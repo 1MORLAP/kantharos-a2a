@@ -11,7 +11,7 @@ reimplement delivery or the completion-notification wake. Those stay in
 upstream `tools/bot_mode_dm.py`.
 
 Pinned to hermes-agent commit
-`ee5ee84a345204a3b1d6ef6ba1ab747e602867b9`
+`f97608f178d1ffeca59860195ab7da295f7c8e5f`
 (`plugin.yaml` `tested_hermes_commit`). `register` refuses to enable on any
 other commit, and the tool call fails closed if `_session_title` stops honoring
 `_session_title_hint`.
