@@ -1,5 +1,5 @@
 # Excerpt of NousResearch/hermes-agent tools/bot_mode_dm.py
-# at ee5ee84a345204a3b1d6ef6ba1ab747e602867b9.
+# at f97608f178d1ffeca59860195ab7da295f7c8e5f.
 # The loud test fails if these two lines disappear from this pin
 # or from a live copy of the same file.
 
