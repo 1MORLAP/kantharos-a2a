@@ -1,0 +1,10 @@
+# Excerpt of NousResearch/hermes-agent tools/bot_mode_dm.py
+# at ee5ee84a345204a3b1d6ef6ba1ab747e602867b9.
+# The loud test fails if these two lines disappear from this pin
+# or from a live copy of the same file.
+
+def message_agent_authorized(agent: Any) -> bool:
+        return _session_title(agent) == BOT_CHAT_TITLE and is_bot_mode_managed(_agent_home(agent))
+
+def _session_title(agent: Any) -> str:
+    title = str(getattr(agent, "_session_title_hint", "") or "").strip()

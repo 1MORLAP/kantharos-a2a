@@ -1,0 +1,11 @@
+name: kantharos-a2a
+version: 0.1.0
+description: Expose native message_agent on every Kantharos profile session. Drops the Bot Chat title gate. Does not retitle sessions.
+tested_hermes_commit: ee5ee84a345204a3b1d6ef6ba1ab747e602867b9
+author: Kantharos
+provides_tools:
+  - message_agent
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - on_session_start
