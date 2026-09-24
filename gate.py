@@ -1,1 +1,1 @@
-__FILE__:/tmp/mcp-file-gate.py
+__FILE__:/workspace/kantharos/a2a-public-staging/gate.py
