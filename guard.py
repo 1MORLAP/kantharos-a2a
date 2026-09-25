@@ -12,7 +12,18 @@ title requirement, and only while one of those two gates is running, when:
 Every other native check still runs. Native Hermes keeps the schema, injection,
 attribution, same-instance delivery, the reply into the sender session, and
 deny mode on the target. ``message_agent_tool`` also gets the Kantharos
-guardrails: hop limit 3, same instance only, no pure acks or ``[SILENT]``.
+loop guard (ADR-0016 loop-guard revision), checked in this order:
+
+1. no pure acks or ``[SILENT]``;
+2. ``reply_via_completion``: in a turn authored by bot X (``agent._turn_author``,
+   set natively at turn start), ``message_agent`` to X is refused. X's final
+   answer already reaches the asker through the delivery completion;
+3. same instance only;
+4. duplicate: an identical (sender, target, body) send within 900 s;
+5. hop limit 3;
+6. pair cap: 6 admitted sends per ordered pair per rolling 60 minutes.
+
+Refusals do not count toward the cap, and there is no retry loop here.
 """
 
 from __future__ import annotations
@@ -24,7 +35,10 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .hops import HopLedger, ack_keys, body_key, hop_refusal, inbound_hop, latest_user_text
+from .hops import (
+    PAIR_CAP, HopLedger, SendLedger, ack_keys, body_digest, body_key, duplicate_refusal, hop_refusal,
+    inbound_hop, latest_user_text, pair_cap_refusal,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +80,55 @@ def error_json(message: str, reason: str) -> str:
     return json.dumps({"error": message, "reason": reason})
 
 
+def parse_bot_author(author: Any) -> Optional[tuple[str, str]]:
+    """``(origin, profile)`` for a bot turn author: ``bot:<profile>`` is ``("", profile)``;
+    ``bot:<connection>/<profile>`` and ``bot:<hostname>/<profile>`` carry the origin. None otherwise."""
+    if not isinstance(author, dict) or not author.get("is_bot"):
+        return None
+    raw = str(author.get("id") or "").strip()
+    if not raw.startswith("bot:") or len(raw) <= 4:
+        return None
+    rest = raw[4:]
+    origin, _, profile = rest.rpartition("/")
+    profile = profile.strip()
+    return (origin.strip(), profile) if profile else None
+
+
+def _target_origin_profile(raw: str) -> Optional[tuple[str, str]]:
+    if "/" in raw:
+        origin, _, profile = raw.partition("/")
+    elif "@" in raw:
+        profile, _, origin = raw.rpartition("@")
+    else:
+        return None
+    return (origin.strip(), profile.strip()) if origin.strip() and profile.strip() else None
+
+
+def reply_target(author: Any, target: str, resolve: Callable[[str], Optional[str]]) -> str:
+    """The author's name when ``target`` resolves to the bot that authored this turn, else "".
+    Same profile and, for a relayed or peer author, the same connection or peer."""
+    parsed = parse_bot_author(author)
+    raw = str(target or "").strip().lstrip("@")
+    if parsed is None or not raw:
+        return ""
+    origin, profile = parsed
+    name = str((author or {}).get("name") or profile)
+    if not origin:
+        if _target_origin_profile(raw) is not None:
+            return ""
+        resolved = resolve(raw)
+        hit = resolved == profile if resolved is not None else raw.lower() == profile.lower()
+        return name if hit else ""
+    other = _target_origin_profile(raw)
+    if other is None:
+        return ""
+    return name if (other[0].lower(), other[1].lower()) == (origin.lower(), profile.lower()) else ""
+
+
+def reply_refusal(name: str) -> str:
+    return f"Your final answer is delivered to {name} automatically. Do not call message_agent to reply."
+
+
 def target_refusal(target: str, *, roster: list[str], peers: list[str], me: str,
                    resolve: Callable[[str], Optional[str]]) -> tuple[str, str]:
     """(message, reason) when ``target`` is not one teammate profile on this instance."""
@@ -87,10 +150,20 @@ def target_refusal(target: str, *, roster: list[str], peers: list[str], me: str,
 class NativeGateWrap:
     """Installs and removes the wrappers on ``tools.bot_mode_dm``."""
 
-    def __init__(self, dm: Any, probe: Any):
+    def __init__(self, dm: Any, probe: Any, on_gate: Optional[Callable[[], None]] = None):
         self.dm = dm
         self.probe = probe
         self.originals: dict[str, Any] = {}
+        # Called whenever a gate runs: the chat host installs its reap exemption lazily.
+        self.on_gate = on_gate
+
+    def _touch(self) -> None:
+        if self.on_gate is None:
+            return
+        try:
+            self.on_gate()
+        except Exception:
+            logger.warning("kantharos-a2a: on_gate hook failed", exc_info=True)
 
     # native helpers -------------------------------------------------------
     def _home(self, agent: Any) -> str:
@@ -103,9 +176,15 @@ class NativeGateWrap:
             logger.debug("kantharos-a2a managed check failed", exc_info=True)
             return False
 
-    def ledger(self, agent: Any) -> HopLedger:
+    def _data_dir(self, agent: Any) -> Path:
         root = Path(self.probe._hermes_root(Path(self._home(agent))))
-        return HopLedger(root / "plugin-data" / "kantharos-a2a")
+        return root / "plugin-data" / "kantharos-a2a"
+
+    def ledger(self, agent: Any) -> HopLedger:
+        return HopLedger(self._data_dir(agent))
+
+    def sends(self, agent: Any) -> SendLedger:
+        return SendLedger(self._data_dir(agent))
 
     # wrappers -------------------------------------------------------------
     def _session_title(self, original: Callable[[Any], str]) -> Callable[[Any], str]:
@@ -123,6 +202,7 @@ class NativeGateWrap:
     def _authorized(self, original: Callable[[Any], bool]) -> Callable[[Any], bool]:
         @functools.wraps(original)
         def wrapped(agent: Any) -> bool:
+            self._touch()
             token = _IN_GATE.set(True)
             try:
                 allowed = bool(original(agent))
@@ -146,6 +226,7 @@ class NativeGateWrap:
     def _tool(self, original: Callable[..., str]) -> Callable[..., str]:
         @functools.wraps(original)
         def wrapped(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None) -> str:
+            self._touch()
             session = getattr(agent, "session_id", "")
             if is_silent_or_ack(message):
                 logger.info("kantharos-a2a: refused message_agent session=%s reason=silent_ack", session)
@@ -157,20 +238,42 @@ class NativeGateWrap:
                 roster = [name for name, _ in self.probe._roster(root)]
                 peers = list(self.probe._peers(root))
                 me = self.probe._profile_name(home)
-                problem, reason = target_refusal(
-                    target, roster=roster, peers=peers, me=me,
-                    resolve=lambda raw: self.dm._resolve_local_name(raw, roster, root),
-                )
+
+                def resolve(raw: str) -> Optional[str]:
+                    return self.dm._resolve_local_name(raw, roster, root)
+
+                author = getattr(agent, "_turn_author", None)
+                reply_to = reply_target(author, target, resolve)
+                problem, reason = target_refusal(target, roster=roster, peers=peers, me=me, resolve=resolve)
+                resolved = resolve(str(target or "").strip().lstrip("@")) if not problem else None
                 ledger = self.ledger(agent)
+                sends = self.sends(agent)
                 hop_in, source = inbound_hop(latest_user_text(agent), ledger.lookup)
             except Exception as exc:
                 logger.warning("kantharos-a2a: refused message_agent session=%s reason=guard_error %s", session, exc)
                 return error_json(f"kantharos-a2a could not check this message ({exc}). It was not sent.",
                                   "guard_error")
+            if reply_to:
+                logger.warning(
+                    "kantharos-a2a: refused message_agent reason=reply_via_completion session=%s profile=%s "
+                    "target=%r author=%s", session, me, target, (author or {}).get("id"))
+                return error_json(reply_refusal(reply_to), "reply_via_completion")
             if problem:
                 logger.info("kantharos-a2a: refused message_agent session=%s target=%r reason=%s",
                             session, target, reason)
                 return error_json(problem, reason)
+            digest = body_digest(message)
+            try:
+                pair_count, dup_age = sends.check(me, resolved, digest)
+            except Exception as exc:
+                logger.warning("kantharos-a2a: refused message_agent session=%s reason=guard_error %s", session, exc)
+                return error_json(f"kantharos-a2a could not check this message ({exc}). It was not sent.",
+                                  "guard_error")
+            refusal = duplicate_refusal(dup_age, f"@{resolved}")
+            if refusal:
+                logger.warning("kantharos-a2a: refused message_agent reason=duplicate age=%ds session=%s "
+                               "profile=%s target=%s", int(dup_age or 0), session, me, resolved)
+                return error_json(refusal, "duplicate")
             hop = hop_in + 1
             refusal = hop_refusal(hop)
             if refusal:
@@ -179,6 +282,11 @@ class NativeGateWrap:
                     hop, session, me, target, source,
                 )
                 return error_json(refusal, "hop_limit")
+            refusal = pair_cap_refusal(pair_count, f"@{resolved}")
+            if refusal:
+                logger.warning("kantharos-a2a: refused message_agent reason=pair_cap count=%d limit=%d "
+                               "session=%s profile=%s target=%s", pair_count, PAIR_CAP, session, me, resolved)
+                return error_json(refusal, "pair_cap")
             token = _IN_GATE.set(True)
             try:
                 raw = original(target=target, message=message, task_id=task_id, agent=agent)
@@ -191,13 +299,15 @@ class NativeGateWrap:
             if isinstance(ack, dict) and not ack.get("error") and str(ack.get("status") or "") in ACK_STATUSES:
                 try:
                     ledger.record([body_key(message), *ack_keys(ack)], hop)
+                    sends.admit(me, resolved, digest, str(ack.get("delivery_id") or ""))
                 except Exception:
-                    logger.warning("kantharos-a2a: hop ledger write failed", exc_info=True)
+                    logger.warning("kantharos-a2a: loop-guard ledger write failed", exc_info=True)
                 ack["hop"] = hop
                 logger.info(
-                    "kantharos-a2a: message_agent %s hop=%d session=%s profile=%s to=%s delivery_id=%s process_id=%s (%s)",
-                    ack.get("status"), hop, session, me, ack.get("to"), ack.get("delivery_id"),
-                    ack.get("process_id", ""), source,
+                    "kantharos-a2a: message_agent %s hop=%d pair=%d/%d session=%s profile=%s to=%s delivery_id=%s "
+                    "process_id=%s (%s)",
+                    ack.get("status"), hop, pair_count + 1, PAIR_CAP, session, me, ack.get("to"),
+                    ack.get("delivery_id"), ack.get("process_id", ""), source,
                 )
                 return json.dumps(ack)
             logger.info("kantharos-a2a: native message_agent returned no ack session=%s: %s",

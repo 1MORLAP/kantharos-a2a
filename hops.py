@@ -111,10 +111,10 @@ def latest_user_text(agent: Any) -> str:
 class HopLedger:
     """JSON ledger under ``<hermes root>/plugin-data/kantharos-a2a``. Holds hashes and ids only."""
 
-    def __init__(self, directory: Path, *, now: Callable[[], float] = time.time):
+    def __init__(self, directory: Path, *, now: Optional[Callable[[], float]] = None):
         self.directory = Path(directory)
         self.path = self.directory / "hops.json"
-        self._now = now
+        self._now = now or (lambda: time.time())
 
     @contextlib.contextmanager
     def _locked(self):
@@ -165,4 +165,66 @@ class HopLedger:
             fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
                 json.dump(data, stream)
+            os.replace(tmp, self.path)
+
+
+# Backstops next to the hop limit (ADR-0016 loop-guard revision).
+PAIR_CAP = 6
+PAIR_WINDOW_SECONDS = 60 * 60
+DEDUP_SECONDS = 900
+
+
+def body_digest(body: str) -> str:
+    return hashlib.sha256(str(body or "").strip().encode("utf-8")).hexdigest()
+
+
+def pair_cap_refusal(count: int, target: str) -> str:
+    if count < PAIR_CAP:
+        return ""
+    return (f"Pair cap reached: {count} messages to {target} in the last 60 minutes (limit {PAIR_CAP}). "
+            "It was not sent. Do not retry.")
+
+
+def duplicate_refusal(age: Optional[float], target: str) -> str:
+    if age is None:
+        return ""
+    return (f"Duplicate: you already sent this exact message to {target} {int(age)} s ago. "
+            "It was not sent again. Do not retry.")
+
+
+class SendLedger(HopLedger):
+    """Admitted sends as ``[sender, target, body sha256, time, delivery_id]`` rows in ``sends.json``.
+    Only sends native acknowledged are recorded, so refusals never count toward the pair cap."""
+
+    def __init__(self, directory: Path, *, now: Optional[Callable[[], float]] = None):
+        super().__init__(directory, now=now)
+        self.path = self.directory / "sends.json"
+
+    def _rows(self) -> list:
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        cutoff = self._now() - PAIR_WINDOW_SECONDS
+        return [r for r in data if isinstance(r, list) and len(r) == 5 and float(r[3]) >= cutoff] \
+            if isinstance(data, list) else []
+
+    def check(self, sender: str, target: str, digest: str) -> tuple[int, Optional[float]]:
+        """(admitted sends sender->target in the window, age of an identical send within 900 s or None)."""
+        with self._locked():
+            rows = self._rows()
+        now = self._now()
+        pair = [r for r in rows if r[0] == sender and r[1] == target]
+        same = [now - float(r[3]) for r in pair if r[2] == digest and now - float(r[3]) <= DEDUP_SECONDS]
+        return len(pair), (min(same) if same else None)
+
+    def admit(self, sender: str, target: str, digest: str, delivery_id: str = "") -> None:
+        with self._locked():
+            rows = self._rows()
+            rows.append([sender, target, digest, self._now(), str(delivery_id or "")])
+            rows = rows[-LEDGER_MAX_ENTRIES:]
+            tmp = self.path.with_suffix(".tmp")
+            fd = os.open(tmp, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(rows, stream)
             os.replace(tmp, self.path)
