@@ -44,6 +44,10 @@ CONSTANTS: tuple[tuple[str, str, Any], ...] = (
 # Callers that must still route through the wrapped module attributes.
 MODULE_SOURCES: tuple[tuple[str, str], ...] = (
     ("agent.turn_context", "ensure_message_agent_tool(agent)"),
+    # reply_via_completion reads the turn author native sets on the agent before injection.
+    ("agent.turn_context", "agent._turn_author = turn_author"),
+    ("agent.turn_author", 'f"bot:{origin}/{profile}" if origin else f"bot:{profile}"'),
+    ("tools.bot_mode_dm", 'author = {"id": f"bot:{me}", "name": _handle(me), "is_bot": True}'),
     ("agent.inline_tool_executors", '"tools.bot_mode_dm", "message_agent_tool"'),
 )
 
@@ -128,3 +132,94 @@ def contract_refusal(problems: list[str]) -> str:
         "kantharos-a2a refused to enable: the native message_agent gate changed, so nothing was wrapped. "
         + "; ".join(problems)
     )
+
+
+# Reap exemption (ADR-0016 reap-exemption amendment). The live reapers resolve the predicate
+# from tui_gateway.server, where bind_module rebinds it; that binding is the one wrapped.
+REAP_FUNCTIONS: tuple[tuple[str, str, tuple[str, ...], tuple[str, ...]], ...] = (
+    (
+        "tui_gateway.session_lifecycle",
+        "_session_has_active_delegations",
+        ("sid", "session"),
+        ('session.get("agent")', "has_live_for_session("),
+    ),
+    ("tools.process_registry", "ProcessRegistry.running_owned_by", ("self", "owner_task_id"), ("s.owner_task_id == owner_task_id",)),
+)
+
+REAP_MODULE_SOURCES: tuple[tuple[str, str], ...] = (
+    ("tui_gateway.session_lifecycle", "if _session_has_active_delegations(sid, current):"),
+    ("tui_gateway.session_lifecycle", 'bind_module(globals(), server, skip=("_",))'),
+    ("tui_gateway.session_reaper", "_session_has_active_delegations(sid, session)"),
+    ("tui_gateway.session_reaper", 'bind_module(globals(), server, skip=("_",))'),
+    ("tui_gateway.prompt_turn", 'owner_task_id=session.get("session_key")'),
+    ("tools.process_registry", "owner_task_id: str"),
+    ("tools.process_registry", "notify_on_complete: bool"),
+    ("tools.process_registry", "exited: bool"),
+    ("tools.process_registry", "started_at: float"),
+    ("tools.process_registry", "command: str"),
+    ("tools.process_registry", "process_registry = ProcessRegistry()"),
+    ("tools.bot_relay", '"--wait-reply"'),
+    ("tools.bot_mode_dm", '"--run-delivery"'),
+    ("tools.bot_mode_dm", "notify_on_complete=True, task_id=task_id"),
+)
+
+
+def verify_reap_contract(import_module: Callable[[str], Any] = importlib.import_module) -> list[str]:
+    """Problems with the native reap-exemption surface. Empty means safe to wrap."""
+    problems: list[str] = []
+    modules: dict[str, Any] = {}
+
+    def module(name: str) -> Any:
+        if name not in modules:
+            try:
+                modules[name] = import_module(name)
+            except Exception as exc:
+                modules[name] = None
+                problems.append(f"{name} could not be imported ({type(exc).__name__}: {exc})")
+        return modules[name]
+
+    for mod_name, attr, params, fragments in REAP_FUNCTIONS:
+        mod = module(mod_name)
+        if mod is None:
+            continue
+        fn: Any = mod
+        for part in attr.split("."):
+            fn = getattr(fn, part, None)
+        fn = _unwrapped(fn)
+        if not callable(fn):
+            problems.append(f"{mod_name}.{attr} is missing")
+            continue
+        try:
+            found = tuple(inspect.signature(fn).parameters)
+        except (TypeError, ValueError):
+            found = ()
+        if found != params:
+            problems.append(f"{mod_name}.{attr} signature changed: expected {params}, found {found}")
+        text = _source(fn)
+        if not text:
+            problems.append(f"{mod_name}.{attr} source is unreadable")
+        for fragment in fragments:
+            if text and fragment not in text:
+                problems.append(f"{mod_name}.{attr} no longer contains {fragment!r}")
+
+    for mod_name, fragment in REAP_MODULE_SOURCES:
+        mod = module(mod_name)
+        if mod is None:
+            continue
+        text = _source(mod)
+        if not text:
+            problems.append(f"{mod_name} source is unreadable, so the reap exemption cannot be verified")
+        elif fragment not in text:
+            problems.append(f"{mod_name} no longer contains {fragment!r}")
+    return problems
+
+
+def server_predicate_problem(server: Any, lifecycle: Any) -> str:
+    """tui_gateway.server must carry the bind_module rebinding of the lifecycle predicate."""
+    fn = _unwrapped(getattr(server, "_session_has_active_delegations", None))
+    native = _unwrapped(getattr(lifecycle, "_session_has_active_delegations", None))
+    if not callable(fn):
+        return "tui_gateway.server._session_has_active_delegations is missing"
+    if getattr(fn, "__code__", None) is not getattr(native, "__code__", object()):
+        return "tui_gateway.server._session_has_active_delegations is not the session_lifecycle predicate"
+    return ""

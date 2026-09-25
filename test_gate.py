@@ -267,6 +267,316 @@ class HopTests(unittest.TestCase):
         self.assertNotIn("private body", raw)
 
 
+
+reap = sys.modules["kantharos_a2a_under_test.reap"]
+
+
+def bot_agent(root, profile, author=None, rows=None, title="Bot Chat", platform="cli"):
+    home = str(Path(root) / "profiles" / profile) if profile != "default" else str(root)
+    agent = Agent(title=title, platform=platform, home=home, rows=rows or [{"role": "user", "content": "go"}])
+    agent._turn_author = author
+    return agent
+
+
+class LoopGuardTests(unittest.TestCase):
+    """ADR-0016 loop-guard revision: reply_via_completion, duplicate, hop, pair_cap."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        for name in ("bot001", "bot002", "bot003"):
+            (self.root / "profiles" / name).mkdir(parents=True)
+        self.dm, self.probe, self.calls = fake_native(roster=("default", "bot001", "bot002", "bot003"))
+        self.wrap = guard.NativeGateWrap(self.dm, self.probe)
+        self.wrap.install()
+        self.clock = [1_000_000.0]
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(hops.time, "time", side_effect=lambda: self.clock[0]).start()
+
+    def tearDown(self):
+        self.wrap.uninstall()
+        self.tmp.cleanup()
+
+    def send(self, agent, target, message):
+        return json.loads(self.dm.message_agent_tool(target=target, message=message, agent=agent))
+
+    # rule 1 ---------------------------------------------------------------
+    def test_reply_to_the_asking_bot_is_refused_local_author(self):
+        author = {"id": "bot:bot003", "name": "bot003", "is_bot": True}
+        agent = bot_agent(self.root, "bot001", author)
+        with self.assertLogs(guard.logger, "WARNING") as logs:
+            out = self.send(agent, "bot003", "Here are the numbers you asked for: 3.")
+        self.assertEqual(out["reason"], "reply_via_completion")
+        self.assertEqual(out["error"], "Your final answer is delivered to bot003 automatically. "
+                                       "Do not call message_agent to reply.")
+        self.assertIn("reason=reply_via_completion", "\n".join(logs.output))
+        self.assertEqual(self.calls, [])
+
+    def test_questions_are_not_exempt(self):
+        agent = bot_agent(self.root, "bot001", {"id": "bot:bot003", "name": "bot003", "is_bot": True})
+        self.assertEqual(self.send(agent, "@bot003", "Which numbers do you mean?")["reason"], "reply_via_completion")
+
+    def test_friendly_name_of_the_author_is_refused(self):
+        agent = bot_agent(self.root, "bot001", {"id": "bot:bot002", "name": "bot002", "is_bot": True})
+        self.assertEqual(self.send(agent, "Web Factory", "answer")["reason"], "reply_via_completion")
+
+    def test_other_teammate_is_allowed_in_a_bot_authored_turn(self):
+        agent = bot_agent(self.root, "bot001", {"id": "bot:bot003", "name": "bot003", "is_bot": True})
+        self.assertEqual(self.send(agent, "bot002", "Can you check the draft?")["status"], "queued")
+
+    def test_human_author_is_not_refused(self):
+        agent = bot_agent(self.root, "bot001", {"id": "u123", "name": "Tomasz", "is_bot": False},
+                          title="Launch plan", platform="tui")
+        self.assertEqual(self.send(agent, "bot003", "Ping from the user's chat")["status"], "queued")
+        agent._turn_author = None
+        self.assertEqual(self.send(agent, "bot003", "Second ask")["status"], "queued")
+
+    def test_connection_author_is_refused_only_for_the_same_connection(self):
+        author = {"id": "bot:mini/bot003", "name": "bot003", "is_bot": True}
+        agent = bot_agent(self.root, "bot001", author)
+        self.assertEqual(self.send(agent, "mini/bot003", "answer")["reason"], "reply_via_completion")
+        self.assertEqual(self.send(agent, "bot003@mini", "answer")["reason"], "reply_via_completion")
+        # same profile name on this instance is a different bot
+        self.assertEqual(self.send(agent, "bot003", "local teammate")["status"], "queued")
+        # same profile on another connection is not the author (refused only as not same instance)
+        self.assertEqual(self.send(agent, "studio/bot003", "answer")["reason"], "not_same_instance")
+
+    def test_peer_hostname_author_is_refused_only_for_the_same_peer(self):
+        author = {"id": "bot:spark/researcher", "name": "researcher", "is_bot": True}
+        agent = bot_agent(self.root, "bot001", author)
+        out = self.send(agent, "spark/researcher", "answer")
+        self.assertEqual(out["reason"], "reply_via_completion")
+        self.assertIn("delivered to researcher automatically", out["error"])
+        self.assertEqual(self.send(agent, "spark/other", "answer")["reason"], "not_same_instance")
+
+    def test_parse_bot_author_forms(self):
+        self.assertEqual(guard.parse_bot_author({"id": "bot:bot003", "is_bot": True}), ("", "bot003"))
+        self.assertEqual(guard.parse_bot_author({"id": "bot:mini/bot003", "is_bot": True}), ("mini", "bot003"))
+        self.assertEqual(guard.parse_bot_author({"id": "bot:host.local/default", "is_bot": True}),
+                         ("host.local", "default"))
+        self.assertIsNone(guard.parse_bot_author({"id": "bot:bot003", "is_bot": False}))
+        self.assertIsNone(guard.parse_bot_author({"id": "u1", "is_bot": True}))
+        self.assertIsNone(guard.parse_bot_author(None))
+
+    def test_default_profile_author(self):
+        agent = bot_agent(self.root, "bot001", {"id": "bot:default", "name": "hermes", "is_bot": True})
+        self.assertEqual(self.send(agent, "hermes", "answer")["reason"], "reply_via_completion")
+
+    # dedup ----------------------------------------------------------------
+    def test_identical_resend_within_900s_is_refused(self):
+        agent = bot_agent(self.root, "bot001", None, title="Launch plan", platform="tui")
+        self.assertEqual(self.send(agent, "bot002", "Status of the launch?")["status"], "queued")
+        self.clock[0] += 120  # target_busy came back; the model re-sends the same body
+        out = self.send(agent, "bot002", "Status of the launch?")
+        self.assertEqual(out["reason"], "duplicate")
+        self.assertIn("Do not retry", out["error"])
+        self.assertEqual(len(self.calls), 1)
+        self.clock[0] += 900
+        self.assertEqual(self.send(agent, "bot002", "Status of the launch?")["status"], "queued")
+
+    def test_duplicate_is_per_target(self):
+        agent = bot_agent(self.root, "bot001", None, title="Launch plan", platform="tui")
+        self.send(agent, "bot002", "Same body")
+        self.assertEqual(self.send(agent, "bot003", "Same body")["status"], "queued")
+
+    # pair cap -------------------------------------------------------------
+    def test_pair_cap_six_per_rolling_hour(self):
+        agent = bot_agent(self.root, "bot001", None, title="Launch plan", platform="tui")
+        for i in range(6):
+            self.assertEqual(self.send(agent, "bot002", f"question {i}")["status"], "queued", i)
+            self.clock[0] += 60
+        out = self.send(agent, "bot002", "question 7")
+        self.assertEqual(out["reason"], "pair_cap")
+        self.assertIn("Do not retry", out["error"])
+        self.assertEqual(self.send(agent, "bot003", "other pair")["status"], "queued")
+        self.clock[0] += 3600 - 6 * 60 + 1
+        self.assertEqual(self.send(agent, "bot002", "question 8")["status"], "queued")
+
+    def test_refusals_do_not_count_toward_the_cap(self):
+        agent = bot_agent(self.root, "bot001", None, title="Launch plan", platform="tui")
+        self.send(agent, "bot002", "q0")
+        for _ in range(8):
+            self.assertEqual(self.send(agent, "bot002", "q0")["reason"], "duplicate")
+        for i in range(1, 6):
+            self.assertEqual(self.send(agent, "bot002", f"q{i}")["status"], "queued", i)
+        self.assertEqual(self.send(agent, "bot002", "q6")["reason"], "pair_cap")
+
+    def test_forced_ack_loop_stops(self):
+        """f2: a sender woken by each reply keeps messaging the same teammate: hop 3 or the cap stops it."""
+        agent = bot_agent(self.root, "default", None, title="Launch plan", platform="tui")
+        results = []
+        out = self.send(agent, "bot002", "Round 0")
+        results.append(out)
+        for i in range(1, 10):
+            if "process_id" in out:
+                agent._session_db.rows = [{"role": "user", "content":
+                    f"[IMPORTANT: Background process {out['process_id']} exited (code 0).\nOutput:\nThanks {i}]"}]
+            out = self.send(agent, "bot002", f"Round {i}")
+            results.append(out)
+            if "error" in out:
+                break
+        self.assertIn(results[-1]["reason"], {"hop_limit", "pair_cap"})
+        self.assertLessEqual(len(self.calls), 6)
+
+    def test_sends_ledger_holds_no_message_text(self):
+        agent = bot_agent(self.root, "bot001", None, title="Launch plan", platform="tui")
+        self.send(agent, "bot002", "private body text")
+        raw = (self.root / "plugin-data" / "kantharos-a2a" / "sends.json").read_text()
+        self.assertNotIn("private body", raw)
+
+
+class Proc:
+    def __init__(self, pid, command, owner="SK1", started=0.0, notify=True, exited=False):
+        self.id = pid
+        self.command = command
+        self.owner_task_id = owner
+        self.started_at = started
+        self.notify_on_complete = notify
+        self.exited = exited
+
+
+RUNNER = ("/opt/hermes/.venv/bin/python /opt/hermes/tools/bot_mode_dm.py --run-delivery "
+          "--author '{\"id\":\"bot:default\"}' query-file /tmp/dm_x.txt --profile-home /opt/data/profiles/bot002 "
+          "/opt/hermes/.venv/bin/hermes -p bot002 chat -Q")
+WAITER = "/opt/hermes/.venv/bin/python /opt/hermes/tools/bot_mode_dm.py --wait-reply env_1 /opt/data/bot_relay/r.json"
+
+
+class ReapTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 10_000.0
+        self.procs = []
+        registry = types.SimpleNamespace(
+            process_registry=types.SimpleNamespace(
+                running_owned_by=lambda owner: [p for p in self.procs if p.owner_task_id == owner]))
+        self.lifted = True
+        self.wrap = reap.ReapExemptionWrap(registry_mod=registry, lift=lambda agent: self.lifted,
+                                           now=lambda: self.now)
+
+    def session(self, key="SK1"):
+        return {"agent": object(), "session_key": key}
+
+    def test_delivery_mode(self):
+        self.assertEqual(reap.delivery_mode(RUNNER), "--run-delivery")
+        self.assertEqual(reap.delivery_mode(WAITER), "--wait-reply")
+        self.assertEqual(reap.delivery_mode("python tools/bot_mode_dm.py --help"), "")
+        self.assertEqual(reap.delivery_mode("python other/bot_mode_dm.py --run-delivery x"), "")
+        self.assertEqual(reap.delivery_mode("echo bot_mode_dm.py --run-delivery"), "")
+        self.assertEqual(reap.delivery_mode("sleep 100"), "")
+
+    def test_owner_match(self):
+        self.procs = [Proc("p1", RUNNER, owner="SK2", started=self.now - 10)]
+        self.assertIsNone(self.wrap.live_delivery(self.session("SK1")))
+        self.procs.append(Proc("p2", RUNNER, owner="SK1", started=self.now - 10))
+        self.assertEqual(self.wrap.live_delivery(self.session("SK1")).id, "p2")
+        self.assertIsNone(self.wrap.live_delivery({"agent": object(), "session_key": ""}))
+
+    def test_age_caps(self):
+        self.procs = [Proc("p1", RUNNER, started=self.now - 1441)]
+        self.assertIsNone(self.wrap.live_delivery(self.session()))
+        self.procs = [Proc("p1", RUNNER, started=self.now - 1439)]
+        self.assertIsNotNone(self.wrap.live_delivery(self.session()))
+        self.procs = [Proc("w1", WAITER, started=self.now - 3239)]
+        self.assertIsNotNone(self.wrap.live_delivery(self.session()))
+        self.procs = [Proc("w1", WAITER, started=self.now - 3241)]
+        self.assertIsNone(self.wrap.live_delivery(self.session()))
+
+    def test_exited_notify_off_other_commands_and_lift(self):
+        for proc in (Proc("a", RUNNER, started=self.now - 5, exited=True),
+                     Proc("b", RUNNER, started=self.now - 5, notify=False),
+                     Proc("c", "sleep 600", started=self.now - 5)):
+            self.procs = [proc]
+            self.assertIsNone(self.wrap.live_delivery(self.session()), proc.id)
+        self.procs = [Proc("d", RUNNER, started=self.now - 5)]
+        self.lifted = False
+        self.assertIsNone(self.wrap.live_delivery(self.session()))
+
+    def fake_server(self, native_result=False):
+        server = types.ModuleType("fake_tui_server")
+        server._sessions_lock = __import__("threading").Lock()
+        server._sessions = {"sid1": self.session()}
+
+        def _session_has_active_delegations(sid, session=None):
+            return native_result
+
+        server._session_has_active_delegations = _session_has_active_delegations
+        return server
+
+    def test_wrapper_keeps_native_true_and_adds_live_runner(self):
+        server = self.fake_server(native_result=True)
+        self.wrap.install(server)
+        self.addCleanup(self.wrap.uninstall)
+        self.assertTrue(server._session_has_active_delegations("sid1"))
+        server2 = self.fake_server(native_result=False)
+        wrap2 = reap.ReapExemptionWrap(registry_mod=self.wrap.registry_mod, lift=lambda a: True, now=lambda: self.now)
+        wrap2.install(server2)
+        self.addCleanup(wrap2.uninstall)
+        self.assertFalse(server2._session_has_active_delegations("sid1"))
+        self.procs = [Proc("p1", RUNNER, started=self.now - 5)]
+        with self.assertLogs(reap.logger, "INFO"):
+            self.assertTrue(server2._session_has_active_delegations("sid1"))
+        self.assertTrue(server2._session_has_active_delegations("sid1", server2._sessions["sid1"]))
+
+    def test_install_touches_only_the_given_namespace_and_is_idempotent(self):
+        server, lifecycle = self.fake_server(), self.fake_server()
+        native_lifecycle = lifecycle._session_has_active_delegations
+        self.assertEqual(self.wrap.install(server), 1)
+        self.addCleanup(self.wrap.uninstall)
+        self.assertEqual(self.wrap.install(server), 0)
+        self.assertIs(lifecycle._session_has_active_delegations, native_lifecycle)
+        self.wrap.uninstall()
+        self.assertIsNone(getattr(server._session_has_active_delegations, "__kantharos_a2a_original__", None))
+
+    def test_turn_isolation_refuses(self):
+        server = self.fake_server()
+        server._load_dashboard_process_isolation_config = lambda: {"turn_isolation": True}
+        self.assertIn("turn_isolation is on", reap.turn_isolation_refusal(server))
+        server._load_dashboard_process_isolation_config = lambda: {"turn_isolation": False}
+        self.assertEqual(reap.turn_isolation_refusal(server), "")
+        del server._load_dashboard_process_isolation_config
+        self.assertIn("missing", reap.turn_isolation_refusal(server))
+
+    def test_install_reap_exemption_refuses_loudly_with_turn_isolation(self):
+        server = self.fake_server()
+        server._load_dashboard_process_isolation_config = lambda: {"turn_isolation": True}
+        lifecycle = types.ModuleType("tui_gateway.session_lifecycle")
+        lifecycle._session_has_active_delegations = server._session_has_active_delegations
+        pkg = types.ModuleType("tui_gateway")
+        pkg.session_lifecycle = lifecycle
+        state = {"wrap": self.wrap, "installed": False, "refused": False}
+        with mock.patch.dict(sys.modules, {"tui_gateway": pkg, "tui_gateway.server": server,
+                                           "tui_gateway.session_lifecycle": lifecycle}), \
+                mock.patch.dict(plugin._reap_state, state), \
+                self.assertLogs(plugin.logger, "ERROR") as logs:
+            self.assertFalse(plugin.install_reap_exemption())
+            self.assertTrue(plugin._reap_state["refused"])
+        self.assertIn("turn_isolation is on", "\n".join(logs.output))
+        self.assertIsNone(getattr(server._session_has_active_delegations, "__kantharos_a2a_original__", None))
+
+    def test_install_reap_exemption_wraps_server_only(self):
+        server = self.fake_server()
+        server._load_dashboard_process_isolation_config = lambda: {"turn_isolation": False}
+        lifecycle = types.ModuleType("tui_gateway.session_lifecycle")
+        native = server._session_has_active_delegations
+        lifecycle._session_has_active_delegations = native
+        pkg = types.ModuleType("tui_gateway")
+        pkg.session_lifecycle = lifecycle
+        state = {"wrap": self.wrap, "installed": False, "refused": False}
+        with mock.patch.dict(sys.modules, {"tui_gateway": pkg, "tui_gateway.server": server,
+                                           "tui_gateway.session_lifecycle": lifecycle}), \
+                mock.patch.dict(plugin._reap_state, state):
+            self.assertTrue(plugin.install_reap_exemption())
+        self.addCleanup(self.wrap.uninstall)
+        self.assertIs(server._session_has_active_delegations.__kantharos_a2a_original__, native)
+        self.assertIs(lifecycle._session_has_active_delegations, native)
+
+    def test_server_binding_must_be_the_lifecycle_predicate(self):
+        server, lifecycle = self.fake_server(), types.ModuleType("lifecycle")
+        lifecycle._session_has_active_delegations = lambda sid, session=None: False
+        self.assertIn("is not the session_lifecycle predicate", contract.server_predicate_problem(server, lifecycle))
+        lifecycle._session_has_active_delegations = server._session_has_active_delegations
+        self.assertEqual(contract.server_predicate_problem(server, lifecycle), "")
+
+
 class ContractTests(unittest.TestCase):
     """Fail loudly if upstream renames the gate or changes a signature."""
 
@@ -276,9 +586,11 @@ class ContractTests(unittest.TestCase):
         its.INLINE_TOOL_EXECUTORS = {"message_agent": object()}
         mods["agent.inline_tool_executors"] = its
         mods["agent.turn_context"] = types.ModuleType("agent.turn_context")
+        mods["agent.turn_author"] = types.ModuleType("agent.turn_author")
         sources = {
             "agent.inline_tool_executors": '"tools.bot_mode_dm", "message_agent_tool"',
-            "agent.turn_context": "ensure_message_agent_tool(agent)",
+            "agent.turn_context": "agent._turn_author = turn_author\nensure_message_agent_tool(agent)",
+            "agent.turn_author": 'return f"bot:{origin}/{profile}" if origin else f"bot:{profile}"',
         }
         real_source = contract._source
 
@@ -286,6 +598,8 @@ class ContractTests(unittest.TestCase):
             for name, text in sources.items():
                 if obj is mods.get(name):
                     return text
+            if obj is dm:
+                return real_source(obj) + '\nauthor = {"id": f"bot:{me}", "name": _handle(me), "is_bot": True}\n'
             return real_source(obj)
 
         self.addCleanup(setattr, contract, "_source", real_source)
@@ -346,6 +660,40 @@ class ContractTests(unittest.TestCase):
             plugin.register(object())
         verify.assert_not_called()
 
+    def test_missing_turn_author_assignment_refuses(self):
+        dm, probe, _ = fake_native()
+        imp = self.importer(dm, probe)
+        real = contract._source
+
+        def no_author(obj):
+            text = real(obj)
+            return text.replace("agent._turn_author = turn_author", "") if obj is imp("agent.turn_context") else text
+
+        contract._source = no_author
+        problems = contract.verify_native_contract(imp)
+        self.assertTrue(any("agent._turn_author = turn_author" in p for p in problems), problems)
+
+    def test_register_refuses_when_reap_predicate_is_renamed(self):
+        """(g) a renamed tui_gateway.session_lifecycle._session_has_active_delegations refuses register."""
+        lifecycle = types.ModuleType("tui_gateway.session_lifecycle")
+        lifecycle._session_has_active_delegations_v2 = lambda sid, session=None: False
+
+        def imp(name):
+            if name == "tui_gateway.session_lifecycle":
+                return lifecycle
+            raise ImportError(name)
+
+        problems = contract.verify_reap_contract(imp)
+        self.assertTrue(any("_session_has_active_delegations is missing" in p for p in problems), problems)
+        with mock.patch.object(plugin, "hermes_version_refusal", return_value=""), \
+                mock.patch.object(plugin, "verify_native_contract", return_value=[]), \
+                mock.patch.object(plugin, "verify_reap_contract", side_effect=lambda: contract.verify_reap_contract(imp)), \
+                mock.patch.object(guard.NativeGateWrap, "install") as install, \
+                self.assertLogs(plugin.logger, "ERROR") as logs:
+            plugin.register(object())
+        install.assert_not_called()
+        self.assertIn("_session_has_active_delegations is missing", "\n".join(logs.output))
+
     def test_registers_no_tool_toolset_or_hook(self):
         ctx = mock.Mock()
         with mock.patch.object(plugin, "hermes_version_refusal", return_value="refused"), \
@@ -362,7 +710,7 @@ class ContractTests(unittest.TestCase):
 class LiveContractTests(unittest.TestCase):
     """Against the real hermes-agent source at the pinned commit."""
 
-    PREFIXES = ("tools", "agent")
+    PREFIXES = ("tools", "agent", "tui_gateway")
 
     def _ours(self, name):
         return any(name == p or name.startswith(p + ".") for p in self.PREFIXES)
@@ -397,6 +745,18 @@ class LiveContractTests(unittest.TestCase):
     def test_pinned_source_matches_contract(self):
         problems = contract.verify_native_contract(self._import)
         self.assertEqual(problems, [], "LOUD: upstream changed the native message_agent gate: " + "; ".join(problems))
+
+    def test_pinned_source_matches_reap_contract(self):
+        """C-1..C-4 surface at the pin. A yaml stub stands in when PyYAML is not installed here."""
+        stub = types.ModuleType("yaml")
+        stub.safe_load = lambda *a, **k: {}
+        stub.YAMLError = Exception
+        stub.safe_dump = stub.dump = lambda *a, **k: ""
+        stub.SafeLoader = stub.Loader = stub.SafeDumper = stub.Dumper = type("L", (), {})
+        extra = {} if importlib.util.find_spec("yaml") else {"yaml": stub}
+        with mock.patch.dict(sys.modules, extra):
+            problems = contract.verify_reap_contract(self._import)
+        self.assertEqual(problems, [], "LOUD: upstream changed the native reap surface: " + "; ".join(problems))
 
     def test_wrap_on_real_module_lifts_only_the_title(self):
         dm = importlib.import_module("tools.bot_mode_dm")
