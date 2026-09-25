@@ -1,5 +1,5 @@
 name: kantharos-a2a
-version: 0.2.0
-description: Native message_agent on every Kantharos session. Wraps the native Bot Chat title gate at load time. Registers no tool of its own.
+version: 0.3.0
+description: Native message_agent on every Kantharos session. Wraps the native Bot Chat title gate at load time. Adds the Kantharos loop guard and the delivery-runner reap exemption. Registers no tool of its own.
 tested_hermes_commit: f97608f178d1ffeca59860195ab7da295f7c8e5f
 author: Kantharos
