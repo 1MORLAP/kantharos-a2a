@@ -154,6 +154,25 @@ class GateTests(unittest.TestCase):
         self.assertTrue(suppress_widgets(envelope={"kind": "request"}))
         self.assertFalse(suppress_widgets(text="Ask the peer to research our competitors"))
 
+    def test_docker_image_without_git_reads_baked_build_sha(self):
+        import sys
+        import types
+        from unittest import mock
+
+        import gate as gate_mod
+
+        pkg = types.ModuleType("hermes_cli")
+        info = types.ModuleType("hermes_cli.build_info")
+        info.get_code_identity = lambda refresh=False: {"sha": TESTED_HERMES_COMMIT, "source": "build-file"}
+        info.get_build_sha = lambda short=8: TESTED_HERMES_COMMIT
+        pkg.build_info = info
+        with mock.patch.dict(sys.modules, {"hermes_cli": pkg, "hermes_cli.build_info": info}), \
+                mock.patch.object(gate_mod, "_git_install_commit", return_value=""):
+            self.assertEqual(gate_mod.hermes_install_commit(), TESTED_HERMES_COMMIT)
+            self.assertEqual(gate_mod.hermes_version_refusal(""), "")
+            info.get_code_identity = lambda refresh=False: {"sha": "1" * 40, "source": "build-file"}
+            self.assertIn("untested hermes-agent", gate_mod.hermes_version_refusal(""))
+
     def test_untested_hermes_commit_refuses_enable(self):
         self.assertEqual(hermes_version_refusal(TESTED_HERMES_COMMIT), "")
         other = hermes_version_refusal("0" * 40)
